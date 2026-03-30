@@ -339,6 +339,7 @@ export async function runExperiment(mastra: Mastra, config: ExperimentConfig): P
 
         // Run scorers (inline, after target completes)
         const itemScores = await runScorersForItem(
+          mastra,
           scorers,
           item,
           execResult.output,

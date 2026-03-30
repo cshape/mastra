@@ -4,7 +4,7 @@ import { isSupportedLanguageModel } from '../../agent';
 import { MastraError } from '../../error';
 import { validateAndSaveScore } from '../../mastra/hooks';
 import type { ObservabilityContext } from '../../observability';
-import { resolveObservabilityContext } from '../../observability';
+import { EntityType, resolveObservabilityContext } from '../../observability';
 import type { RequestContext } from '../../request-context';
 import type { MastraCompositeStore } from '../../storage';
 import { Workflow } from '../../workflows';
@@ -157,6 +157,7 @@ export async function runEvals(config: {
           target,
           item,
           mastra,
+          targetResult,
         });
       }
 
@@ -383,6 +384,12 @@ async function extractTrajectoryFromTraceStore(
   }
 }
 
+type TracedScoreResult = Record<string, unknown> & {
+  score?: number | null;
+  reason?: string | null;
+  scoreTraceId?: string;
+};
+
 async function runScorers(
   scorers: MastraScorer<any, any, any, any>[] | WorkflowScorerConfig | AgentScorerConfig,
   targetResult: any,
@@ -390,17 +397,23 @@ async function runScorers(
   storage?: MastraCompositeStore,
 ): Promise<Record<string, any>> {
   const scorerResults: Record<string, any> = {};
+  const targetTraceId = targetResult.traceId;
+  const defaultTargetEntityType = targetResult.scoringData?.stepResults ? EntityType.WORKFLOW_RUN : EntityType.AGENT;
 
   if (Array.isArray(scorers)) {
     for (const scorer of scorers) {
       try {
-        const score = await scorer.run({
+        const score = (await scorer.run({
           input: targetResult.scoringData?.input,
           output: targetResult.scoringData?.output,
           groundTruth: item.groundTruth,
           requestContext: item.requestContext,
-          ...resolveObservabilityContext(item),
-        });
+          scoreSource: 'test',
+          evaluationMode: 'experiment',
+          targetScope: 'trace',
+          targetEntityType: defaultTargetEntityType,
+          targetTraceId,
+        })) as unknown as TracedScoreResult;
 
         scorerResults[scorer.id] = score;
       } catch (error) {
@@ -425,13 +438,17 @@ async function runScorers(
       const agentScorerResults: Record<string, any> = {};
       for (const scorer of scorers.agent) {
         try {
-          const score = await scorer.run({
+          const score = (await scorer.run({
             input: targetResult.scoringData?.input,
             output: targetResult.scoringData?.output,
             groundTruth: item.groundTruth,
             requestContext: item.requestContext,
-            ...resolveObservabilityContext(item),
-          });
+            scoreSource: 'test',
+            evaluationMode: 'experiment',
+            targetScope: 'trace',
+            targetEntityType: EntityType.AGENT,
+            targetTraceId,
+          })) as unknown as TracedScoreResult;
           agentScorerResults[scorer.id] = score;
         } catch (error) {
           throw new MastraError(
@@ -466,14 +483,18 @@ async function runScorers(
 
       for (const scorer of scorers.trajectory) {
         try {
-          const score = await scorer.run({
+          const score = (await scorer.run({
             input: targetResult.scoringData?.input,
             output: trajectory,
             groundTruth: item.groundTruth,
             expectedTrajectory: item.expectedTrajectory,
             requestContext: item.requestContext,
-            ...resolveObservabilityContext(item),
-          });
+            scoreSource: 'test',
+            evaluationMode: 'experiment',
+            targetScope: 'trace',
+            targetEntityType: EntityType.TRAJECTORY,
+            targetTraceId,
+          })) as unknown as TracedScoreResult;
           trajectoryScorerResults[scorer.id] = score;
         } catch (error) {
           throw new MastraError(
@@ -500,14 +521,34 @@ async function runScorers(
     if (scorers.workflow) {
       const workflowScorerResults: Record<string, any> = {};
       for (const scorer of scorers.workflow) {
-        const score = await scorer.run({
-          input: targetResult.scoringData.input,
-          output: targetResult.scoringData.output,
-          groundTruth: item.groundTruth,
-          requestContext: item.requestContext,
-          ...resolveObservabilityContext(item),
-        });
-        workflowScorerResults[scorer.id] = score;
+        try {
+          const score = (await scorer.run({
+            input: targetResult.scoringData.input,
+            output: targetResult.scoringData.output,
+            groundTruth: item.groundTruth,
+            requestContext: item.requestContext,
+            scoreSource: 'test',
+            evaluationMode: 'experiment',
+            targetScope: 'trace',
+            targetEntityType: EntityType.WORKFLOW_RUN,
+            targetTraceId,
+          })) as unknown as TracedScoreResult;
+          workflowScorerResults[scorer.id] = score;
+        } catch (error) {
+          throw new MastraError(
+            {
+              domain: 'SCORER',
+              id: 'RUN_EXPERIMENT_SCORER_FAILED_TO_SCORE_RESULT',
+              category: 'USER',
+              text: `Failed to run experiment: Error running workflow scorer ${scorer.id}`,
+              details: {
+                scorerId: scorer.id,
+                item: JSON.stringify(item),
+              },
+            },
+            error,
+          );
+        }
       }
       if (Object.keys(workflowScorerResults).length > 0) {
         scorerResults.workflow = workflowScorerResults;
@@ -522,13 +563,20 @@ async function runScorers(
           const stepResults: Record<string, any> = {};
           for (const scorer of stepScorers) {
             try {
-              const score = await scorer.run({
+              const score = (await scorer.run({
                 input: stepResult.payload !== undefined ? stepResult.payload : targetResult.scoringData.input,
                 output: stepResult.output,
                 groundTruth: item.groundTruth,
                 requestContext: item.requestContext,
-                ...resolveObservabilityContext(item),
-              });
+                scoreSource: 'test',
+                evaluationMode: 'experiment',
+                targetScope: 'span',
+                targetEntityType: EntityType.WORKFLOW_STEP,
+                targetTraceId,
+                tracingMetadata: {
+                  targetStepId: stepId,
+                },
+              })) as unknown as TracedScoreResult;
               stepResults[scorer.id] = score;
             } catch (error) {
               throw new MastraError(
@@ -572,14 +620,18 @@ async function runScorers(
 
       for (const scorer of scorers.trajectory) {
         try {
-          const score = await scorer.run({
+          const score = (await scorer.run({
             input: targetResult.scoringData?.input,
             output: trajectory,
             groundTruth: item.groundTruth,
             expectedTrajectory: item.expectedTrajectory,
             requestContext: item.requestContext,
-            ...resolveObservabilityContext(item),
-          });
+            scoreSource: 'test',
+            evaluationMode: 'experiment',
+            targetScope: 'trace',
+            targetEntityType: EntityType.TRAJECTORY,
+            targetTraceId,
+          })) as unknown as TracedScoreResult;
           trajectoryScorerResults[scorer.id] = score;
         } catch (error) {
           throw new MastraError(
@@ -616,12 +668,14 @@ async function saveScoresToStorage({
   target,
   item,
   mastra,
+  targetResult,
 }: {
   storage: any;
   scorerResults: Record<string, any>;
   target: Agent | Workflow;
   item: RunEvalsDataItem<any>;
   mastra: any;
+  targetResult: { traceId?: string; spanId?: string };
 }): Promise<void> {
   const entityId = target.id;
   const entityType = isWorkflow(target) ? 'WORKFLOW' : 'AGENT';
@@ -635,13 +689,14 @@ async function saveScoresToStorage({
       if (scoreResult && typeof scoreResult === 'object' && 'score' in scoreResult) {
         await saveSingleScore({
           storage,
-          scoreResult,
+          scoreResult: scoreResult as unknown as TracedScoreResult,
           scorerId,
           entityId,
           entityType,
           mastra,
           target,
           item,
+          targetResult,
         });
       }
     }
@@ -652,13 +707,14 @@ async function saveScoresToStorage({
         if (scoreResult && typeof scoreResult === 'object' && 'score' in scoreResult) {
           await saveSingleScore({
             storage,
-            scoreResult,
+            scoreResult: scoreResult as unknown as TracedScoreResult,
             scorerId,
             entityId,
             entityType: 'AGENT',
             mastra,
             target,
             item,
+            targetResult,
           });
         }
       }
@@ -669,13 +725,14 @@ async function saveScoresToStorage({
         if (scoreResult && typeof scoreResult === 'object' && 'score' in scoreResult) {
           await saveSingleScore({
             storage,
-            scoreResult,
+            scoreResult: scoreResult as unknown as TracedScoreResult,
             scorerId,
             entityId,
             entityType: 'TRAJECTORY',
             mastra,
             target,
             item,
+            targetResult,
           });
         }
       }
@@ -687,13 +744,14 @@ async function saveScoresToStorage({
         if (scoreResult && typeof scoreResult === 'object' && 'score' in scoreResult) {
           await saveSingleScore({
             storage,
-            scoreResult,
+            scoreResult: scoreResult as unknown as TracedScoreResult,
             scorerId,
             entityId,
             entityType: 'WORKFLOW',
             mastra,
             target,
             item,
+            targetResult,
           });
         }
       }
@@ -705,13 +763,14 @@ async function saveScoresToStorage({
           if (scoreResult && typeof scoreResult === 'object' && 'score' in scoreResult) {
             await saveSingleScore({
               storage,
-              scoreResult,
+              scoreResult: scoreResult as unknown as TracedScoreResult,
               scorerId,
               entityId: stepId,
               entityType: 'STEP',
               mastra,
               target,
               item,
+              targetResult,
             });
           }
         }
@@ -732,15 +791,17 @@ async function saveSingleScore({
   mastra,
   target,
   item,
+  targetResult,
 }: {
   storage: any;
-  scoreResult: any;
+  scoreResult: TracedScoreResult;
   scorerId: string;
   entityId: string;
   entityType: string;
   mastra: any;
   target: Agent | Workflow;
   item: RunEvalsDataItem<any>;
+  targetResult: { traceId?: string; spanId?: string };
 }): Promise<void> {
   try {
     // Get scorer information
@@ -759,13 +820,7 @@ async function saveSingleScore({
       }
     }
 
-    // Extract tracing context if available
-    let traceId: string | undefined;
-    let spanId: string | undefined;
-    if (item.tracingContext?.currentSpan && item.tracingContext.currentSpan.isValid) {
-      spanId = item.tracingContext.currentSpan.id;
-      traceId = item.tracingContext.currentSpan.traceId;
-    }
+    const traceId = targetResult.traceId ?? item.tracingContext?.currentSpan?.traceId;
 
     // Build additional context with groundTruth if available
     const additionalContext: Record<string, any> = {};
@@ -796,9 +851,9 @@ async function saveSingleScore({
       additionalContext: Object.keys(additionalContext).length > 0 ? additionalContext : undefined,
       // Include tracing information
       traceId,
-      spanId,
     };
 
+    // Legacy score-store emission. This path is being deprecated.
     await validateAndSaveScore(storage, payload);
   } catch (error) {
     // Log error but don't fail the evaluation

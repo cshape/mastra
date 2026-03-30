@@ -254,12 +254,18 @@ export interface ObservabilityEntrypoint {
   /**
    * Add a score to a persisted trace or span without hydrating a RecordedTrace.
    * Useful for durable executions that persist only identifiers across serialization boundaries.
+   *
+   * Use `traceId` alone when the score applies to the full run / full trace.
+   * Only include `spanId` when the score is explicitly about a specific span.
    */
   addScore?(args: { traceId: string; spanId?: string; score: ScoreInput }): Promise<void>;
 
   /**
    * Add feedback to a persisted trace or span without hydrating a RecordedTrace.
    * Useful for durable executions that persist only identifiers across serialization boundaries.
+   *
+   * Use `traceId` alone when the feedback applies to the full run / full trace.
+   * Only include `spanId` when the feedback is explicitly about a specific span.
    */
   addFeedback?(args: { traceId: string; spanId?: string; feedback: FeedbackInput }): Promise<void>;
 

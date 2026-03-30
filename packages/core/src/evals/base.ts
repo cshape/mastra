@@ -7,8 +7,16 @@ import { resolveModelConfig } from '../llm/model/resolve-model';
 import type { MastraModelConfig } from '../llm/model/shared.types';
 import { noopLogger } from '../logger';
 import type { Mastra } from '../mastra';
-import { InternalSpans, resolveObservabilityContext } from '../observability';
-import type { ObservabilityContext } from '../observability';
+import {
+  createObservabilityContext,
+  EntityType,
+  executeWithContext,
+  getOrCreateSpan,
+  resolveObservabilityContext,
+  SpanType,
+} from '../observability';
+import type { ObservabilityContext, Span } from '../observability';
+import { RequestContext } from '../request-context';
 import type { PublicSchema } from '../schema';
 import { toStandardSchema, standardSchemaToJSONSchema } from '../schema';
 import { createWorkflow, createStep } from '../workflows';
@@ -59,14 +67,21 @@ interface ScorerConfig<TID extends string, TInput = any, TRunOutput = any> {
 }
 
 // Standardized input type for all pipelines
-interface ScorerRun<TInput = any, TOutput = any> extends Partial<ObservabilityContext> {
+interface ScorerRun<TInput = any, TOutput = any> {
   runId?: string;
   input?: TInput;
   output: TOutput;
   groundTruth?: any;
   /** Expected trajectory config for trajectory scorers. Flows from dataset items or scorer constructor. */
   expectedTrajectory?: TrajectoryExpectation;
-  requestContext?: Record<string, any>;
+  requestContext?: Record<string, any> | RequestContext;
+  scoreSource?: 'live' | 'test' | 'ci';
+  evaluationMode?: 'live' | 'trace' | 'experiment';
+  targetScope?: 'trace' | 'span';
+  targetEntityType?: EntityType;
+  targetTraceId?: string;
+  targetSpanId?: string;
+  tracingMetadata?: Record<string, unknown>;
 }
 
 // Prompt object definition with conditional typing
@@ -102,7 +117,7 @@ type StepResultKey<T extends string> = `${T}StepResult`;
 type Awaited<T> = T extends Promise<infer U> ? U : T;
 
 // Simplified context type
-type StepContext<TAccumulated extends Record<string, any>, TInput, TRunOutput> = {
+type StepContext<TAccumulated extends Record<string, any>, TInput, TRunOutput> = Partial<ObservabilityContext> & {
   run: ScorerRun<TInput, TRunOutput>;
   results: TAccumulated;
 };
@@ -121,6 +136,7 @@ type GenerateReasonContext<TAccumulated extends Record<string, any>, TInput, TRu
 
 type ScorerRunResult<TAccumulatedResults extends Record<string, any>, TInput, TRunOutput> = Promise<
   ScorerRun<TInput, TRunOutput> & {
+    scoreTraceId?: string;
     score: TAccumulatedResults extends Record<'generateScoreStepResult', infer TScore> ? TScore : never;
     reason?: TAccumulatedResults extends Record<'generateReasonStepResult', infer TReason> ? TReason : undefined;
 
@@ -418,6 +434,20 @@ class MastraScorer<
     return this.steps.some(step => step.name === 'generateScore');
   }
 
+  private normalizeRunRequestContext(
+    requestContext?: Record<string, any> | RequestContext,
+  ): RequestContext | undefined {
+    if (!requestContext) {
+      return undefined;
+    }
+
+    if (requestContext instanceof RequestContext) {
+      return requestContext;
+    }
+
+    return new RequestContext(Object.entries(requestContext));
+  }
+
   async run(input: ScorerRun<TInput, TRunOutput>): ScorerRunResult<TAccumulatedResults, TInput, TRunOutput> {
     // Runtime check: execute only allowed after generateScore
     if (!this.hasGenerateScore) {
@@ -433,25 +463,73 @@ class MastraScorer<
       });
     }
 
-    const observabilityContext = resolveObservabilityContext(input);
-
     let runId = input.runId;
     if (!runId) {
       runId = randomUUID();
     }
 
-    const run = { ...input, runId };
+    const normalizedRequestContext = this.normalizeRunRequestContext(input.requestContext);
+    const evalSpan = getOrCreateSpan({
+      type: SpanType.SCORER_RUN,
+      name: `scorer run: '${this.id}'`,
+      entityType: EntityType.SCORER,
+      entityId: this.id,
+      input: {
+        input: input.input,
+        output: input.output,
+        groundTruth: input.groundTruth,
+        expectedTrajectory: input.expectedTrajectory,
+        requestContext: input.requestContext,
+      },
+      attributes: {
+        scorerId: this.id,
+        scorerName: this.name,
+        ...(input.scoreSource ? { scoreSource: input.scoreSource } : {}),
+        ...(input.evaluationMode ? { evaluationMode: input.evaluationMode } : {}),
+        ...(input.targetScope ? { targetScope: input.targetScope } : {}),
+        ...(input.targetEntityType ? { targetEntityType: input.targetEntityType } : {}),
+        ...(this.source ? { scorerDefinition: this.source } : {}),
+      },
+      requestContext: normalizedRequestContext,
+      metadata: {
+        ...(input.targetTraceId ? { targetTraceId: input.targetTraceId } : {}),
+        ...(input.targetSpanId ? { targetSpanId: input.targetSpanId } : {}),
+        ...(input.tracingMetadata ?? {}),
+      },
+      mastra: this.#mastra,
+    });
+    const run: ScorerRun<TInput, TRunOutput> & { runId: string; scoreTraceId?: string } = {
+      ...input,
+      runId,
+      ...(evalSpan?.traceId ? { scoreTraceId: evalSpan.traceId } : {}),
+    };
+    const scorerObservabilityContext = createObservabilityContext({ currentSpan: evalSpan });
 
     const workflow = this.toMastraWorkflow();
     const workflowRun = await workflow.createRun();
-    const workflowResult = await workflowRun.start({
-      inputData: {
-        run,
-      },
-      ...observabilityContext,
-    });
+    let workflowResult;
+    try {
+      workflowResult = await executeWithContext({
+        span: evalSpan,
+        fn: () =>
+          workflowRun.start({
+            inputData: {
+              run,
+            },
+            ...scorerObservabilityContext,
+          }),
+      });
+    } catch (error) {
+      evalSpan?.error({ error: error as Error, endSpan: true });
+      throw error;
+    }
 
     if (workflowResult.status === 'failed') {
+      const workflowFailure =
+        workflowResult.error instanceof Error
+          ? workflowResult.error
+          : new Error(typeof workflowResult.error === 'string' ? workflowResult.error : 'Scorer workflow failed');
+      evalSpan?.error({ error: workflowFailure, endSpan: true });
       throw new MastraError(
         {
           id: 'MASTR_SCORER_FAILED_TO_RUN_WORKFLOW_FAILED',
@@ -467,7 +545,35 @@ class MastraScorer<
       );
     }
 
-    return this.transformToScorerResult({ workflowResult, originalInput: run });
+    const scorerResult = this.transformToScorerResult({ workflowResult, originalInput: run });
+    evalSpan?.end({
+      output: {
+        success: true,
+        score: typeof scorerResult.score === 'number' ? scorerResult.score : null,
+        reason: typeof scorerResult.reason === 'string' ? scorerResult.reason : null,
+      },
+    });
+
+    if (this.#mastra?.observability.addScore && input.targetTraceId && typeof scorerResult.score === 'number') {
+      try {
+        const scoreSource = input.scoreSource?.toUpperCase();
+        await this.#mastra.observability.addScore({
+          traceId: input.targetTraceId,
+          spanId: input.targetSpanId,
+          score: {
+            scorerId: this.id,
+            ...(scoreSource ? { source: scoreSource, scoreSource } : {}),
+            score: scorerResult.score,
+            ...(typeof scorerResult.reason === 'string' ? { reason: scorerResult.reason } : {}),
+            ...(typeof scorerResult.scoreTraceId === 'string' ? { scoreTraceId: scorerResult.scoreTraceId } : {}),
+          },
+        });
+      } catch (error) {
+        this.#mastra.getLogger()?.warn?.(`Failed to emit score to observability for scorer ${this.id}:`, error);
+      }
+    }
+
+    return scorerResult;
   }
 
   private isPromptObject(stepDef: any): boolean {
@@ -510,19 +616,68 @@ class MastraScorer<
           const { run } = getInitData<{ run: ScorerRun<TInput, TRunOutput> }>();
 
           const context = this.createScorerContext(scorerStep.name, run, accumulatedResults);
+          const currentSpan = observabilityContext.tracingContext.currentSpan;
+          const scorerRunSpan =
+            currentSpan?.type === SpanType.SCORER_RUN
+              ? (currentSpan as Span<SpanType.SCORER_RUN>)
+              : (currentSpan?.findParent(SpanType.SCORER_RUN) as Span<SpanType.SCORER_RUN> | undefined);
+          const stepSpan = scorerRunSpan?.createChildSpan({
+            type: SpanType.SCORER_STEP,
+            name: `scorer step: '${scorerStep.name}'`,
+            entityType: EntityType.SCORER,
+            entityId: this.config.id ?? this.config.name,
+            input: context,
+            attributes: {
+              step: scorerStep.name,
+              stepType: scorerStep.isPromptObject ? 'prompt' : 'function',
+            },
+          });
+          const stepObservabilityContext = createObservabilityContext({ currentSpan: stepSpan });
+          const executionContext = {
+            ...context,
+            ...stepObservabilityContext,
+          };
 
-          let stepResult;
-          let newGeneratedPrompts = generatedPrompts;
-          if (scorerStep.isPromptObject) {
-            const { result, prompt } = await this.executePromptStep(scorerStep, observabilityContext, context);
-            stepResult = result;
-            newGeneratedPrompts = {
-              ...generatedPrompts,
-              [`${scorerStep.name}Prompt`]: prompt,
-            };
-          } else {
-            stepResult = await this.executeFunctionStep(scorerStep, context);
+          let stepResult: unknown;
+          let prompt: string | undefined;
+          let judgeModel: string | undefined;
+
+          try {
+            if (scorerStep.isPromptObject) {
+              const promptStepResult = await this.executePromptStep(
+                scorerStep,
+                stepObservabilityContext,
+                executionContext,
+              );
+              stepResult = promptStepResult.result;
+              prompt = promptStepResult.prompt;
+              judgeModel = promptStepResult.judgeModel;
+            } else {
+              stepResult = await this.executeFunctionStep(scorerStep, executionContext);
+            }
+          } catch (error) {
+            stepSpan?.error({ error: error as Error, endSpan: true });
+            throw error;
           }
+
+          if (prompt !== undefined || judgeModel !== undefined) {
+            stepSpan?.update({
+              attributes: {
+                ...(prompt !== undefined ? { prompt } : {}),
+                ...(judgeModel !== undefined ? { judgeModel } : {}),
+              },
+            });
+          }
+
+          stepSpan?.end({ output: stepResult });
+
+          const newGeneratedPrompts =
+            prompt !== undefined
+              ? {
+                  ...generatedPrompts,
+                  [`${scorerStep.name}Prompt`]: prompt,
+                }
+              : generatedPrompts;
 
           const newAccumulatedResults = {
             ...accumulatedResults,
@@ -556,10 +711,6 @@ class MastraScorer<
         generateReasonPrompt: z.string().optional(),
       }),
       options: {
-        // mark all spans generated as part of the scorer workflow internal
-        tracingPolicy: {
-          internal: InternalSpans.ALL,
-        },
         validateInputs: false,
       },
     });
@@ -596,7 +747,7 @@ class MastraScorer<
     scorerStep: ScorerStepDefinition,
     observabilityContext: ObservabilityContext,
     context: any,
-  ) {
+  ): Promise<{ result: unknown; prompt: string; judgeModel?: string }> {
     const originalStep = this.originalPromptObjects.get(scorerStep.name);
     if (!originalStep) {
       throw new Error(`Step "${scorerStep.name}" is not a prompt object`);
@@ -622,13 +773,13 @@ class MastraScorer<
     // Resolve the model configuration to a LanguageModel instance
     // Pass the Mastra instance to enable custom gateway resolution
     const resolvedModel = await resolveModelConfig(modelConfig, undefined, this.#mastra);
+    const judgeModel = resolvedModel.modelId;
 
     const judge = new Agent({
       id: 'judge',
       name: 'judge',
       model: resolvedModel,
       instructions,
-      options: { tracingPolicy: { internal: InternalSpans.ALL } },
     });
 
     // GenerateScore output must be a number
@@ -651,7 +802,7 @@ class MastraScorer<
           ...observabilityContext,
         });
       }
-      return { result: (result.object as { score: number }).score, prompt };
+      return { result: (result.object as { score: number }).score, prompt, judgeModel };
 
       // GenerateReason output must be a string
     } else if (scorerStep.name === 'generateReason') {
@@ -661,7 +812,7 @@ class MastraScorer<
       } else {
         result = await judge.generateLegacy(prompt, { ...observabilityContext });
       }
-      return { result: result.text, prompt };
+      return { result: result.text, prompt, judgeModel };
     } else {
       const promptStep = originalStep as PromptObject<any, any, any, TInput, TRunOutput>;
       // Convert to StandardSchemaWithJSON at runtime to ensure ~standard.jsonSchema is available
@@ -682,7 +833,7 @@ class MastraScorer<
           ...observabilityContext,
         });
       }
-      return { result: result.object, prompt };
+      return { result: result.object, prompt, judgeModel };
     }
   }
 
@@ -691,7 +842,7 @@ class MastraScorer<
     originalInput,
   }: {
     workflowResult: any;
-    originalInput: ScorerRun<TInput, TRunOutput> & { runId: string };
+    originalInput: ScorerRun<TInput, TRunOutput> & { runId: string; scoreTraceId?: string };
   }) {
     const finalStepResult = workflowResult.result;
     const accumulatedResults = finalStepResult?.accumulatedResults || {};

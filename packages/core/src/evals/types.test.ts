@@ -310,7 +310,7 @@ describe('extractTrajectoryFromTrace', () => {
     expect(result.steps[5]!.stepType).toBe('workflow_wait_event');
   });
 
-  it('skips noise spans (generic, model_step, model_chunk, workflow_conditional_eval)', () => {
+  it('skips noise spans (scorer_run, generic, model_step, model_chunk, workflow_conditional_eval)', () => {
     const root = createSpan({
       spanId: 'agent-root',
       spanType: SpanType.AGENT_RUN,
@@ -320,6 +320,14 @@ describe('extractTrajectoryFromTrace', () => {
     });
 
     const children: SpanRecord[] = [
+      createSpan({
+        spanId: 'scorer-run',
+        parentSpanId: 'agent-root',
+        spanType: SpanType.SCORER_RUN,
+        name: 'scorer-run',
+        startedAt: new Date('2025-01-01T00:00:00.500Z'),
+        endedAt: new Date('2025-01-01T00:00:00.900Z'),
+      }),
       createSpan({
         spanId: 'generic',
         parentSpanId: 'agent-root',

@@ -26,6 +26,10 @@ import type { ScoreInput } from './scores';
 export enum SpanType {
   /** Agent run - root span for agent processes */
   AGENT_RUN = 'agent_run',
+  /** Scorer execution */
+  SCORER_RUN = 'scorer_run',
+  /** Individual scorer pipeline step */
+  SCORER_STEP = 'scorer_step',
   /** Generic span for custom operations */
   GENERIC = 'generic',
   /** Model generation with model calls, token usage, prompts, completions */
@@ -96,6 +100,29 @@ export interface AgentRunAttributes extends AIBaseAttributes {
     /** Additional metadata */
     metadata?: unknown;
   };
+}
+
+/**
+ * Scorer Run attributes
+ */
+export interface ScorerRunAttributes extends AIBaseAttributes {
+  scorerId?: string;
+  scorerName?: string;
+  scoreSource?: 'live' | 'test' | 'ci';
+  evaluationMode?: 'live' | 'trace' | 'experiment';
+  targetScope?: 'trace' | 'span';
+  targetEntityType?: EntityType;
+  scorerDefinition?: 'code' | 'stored';
+}
+
+/**
+ * Scorer Step attributes
+ */
+export interface ScorerStepAttributes extends AIBaseAttributes {
+  step?: string;
+  stepType?: 'function' | 'prompt';
+  prompt?: string;
+  judgeModel?: string;
 }
 
 /**
@@ -359,6 +386,8 @@ export interface WorkflowWaitEventAttributes extends AIBaseAttributes {
  */
 export interface SpanTypeMap {
   [SpanType.AGENT_RUN]: AgentRunAttributes;
+  [SpanType.SCORER_RUN]: ScorerRunAttributes;
+  [SpanType.SCORER_STEP]: ScorerStepAttributes;
   [SpanType.WORKFLOW_RUN]: WorkflowRunAttributes;
   [SpanType.MODEL_GENERATION]: ModelGenerationAttributes;
   [SpanType.MODEL_STEP]: ModelStepAttributes;
