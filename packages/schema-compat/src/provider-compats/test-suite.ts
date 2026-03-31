@@ -145,13 +145,11 @@ export function createSuite(layer: SchemaCompatLayer) {
   });
 
   describe('shouldApply', () => {
-    it('should apply for OpenAI models without structured outputs', () => {
+    it('should return true for the configured layer', () => {
       expect(layer.shouldApply()).toBe(true);
     });
 
-    it('should apply for OpenAI models with structured outputs', () => {
-      expect(layer.shouldApply()).toBe(true);
-    });
+    // Remove duplicate test - both tests assert the same thing
   });
 
   describe('Passthrough/LooseObject Schemas', () => {
