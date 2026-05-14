@@ -15,6 +15,7 @@ import type { MetricsContext, MetricEvent } from './metrics';
 import type { ScoreEvent, ScoreInput } from './scores';
 import type {
   AnySpan,
+  AnyExportedSpan,
   RecordedTrace,
   CreateSpanOptions,
   EntityType,
@@ -48,12 +49,15 @@ export interface CorrelationContext {
   entityType?: EntityType;
   entityId?: string;
   entityName?: string;
+  entityVersionId?: string;
   parentEntityType?: EntityType;
   parentEntityId?: string;
   parentEntityName?: string;
+  parentEntityVersionId?: string;
   rootEntityType?: EntityType;
   rootEntityId?: string;
   rootEntityName?: string;
+  rootEntityVersionId?: string;
   userId?: string;
   organizationId?: string;
   resourceId?: string;
@@ -114,6 +118,22 @@ export interface ObservabilityContext {
 }
 
 // ============================================================================
+// Shared Scorer Types
+// ============================================================================
+
+/** Where a registered definition came from. */
+export type DefinitionSource = 'code' | 'stored';
+
+/** What kind of scoring flow produced the score. */
+export type ScorerScoreSource = 'live' | 'trace' | 'experiment';
+
+/** How the scorer interpreted the target data. */
+export type ScorerTargetScope = 'span' | 'trajectory';
+
+/** Execution style for a scorer step. */
+export type ScorerStepType = 'function' | 'prompt';
+
+// ============================================================================
 // ObservabilityEventBus
 // ============================================================================
 
@@ -140,6 +160,33 @@ export interface ObservabilityEventBus<TEvent> {
  * Used by the unified ObservabilityBus that handles all signals.
  */
 export type ObservabilityEvent = TracingEvent | LogEvent | MetricEvent | ScoreEvent | FeedbackEvent;
+
+/** Signal whose event was dropped by the observability exporter pipeline. */
+export type ObservabilityDropSignal = 'tracing' | 'log' | 'metric' | 'score' | 'feedback';
+
+/** Reason an observability event was dropped by the exporter pipeline. */
+export type ObservabilityDropReason = 'unsupported-storage' | 'retry-exhausted';
+
+/** Sanitized error details for observability drop events. */
+export interface ObservabilityDropError {
+  id?: string;
+  domain?: string;
+  message: string;
+}
+
+/**
+ * Structured event emitted when the exporter pipeline drops observability events.
+ */
+export interface ObservabilityDropEvent {
+  type: 'drop';
+  signal: ObservabilityDropSignal;
+  reason: ObservabilityDropReason;
+  count: number;
+  timestamp: Date;
+  exporterName: string;
+  storageName?: string;
+  error?: ObservabilityDropError;
+}
 
 // ============================================================================
 // ObservabilityInstance
@@ -238,6 +285,22 @@ export interface ObservabilityInstance {
    * @param exporter - The exporter to register
    */
   registerExporter?(exporter: ObservabilityExporter): void;
+
+  /**
+   * Returns the deployment environment propagated from the parent Mastra
+   * instance (resolved from `Mastra` config `environment` or `process.env.NODE_ENV`).
+   * Used by spans as a fallback when `metadata.environment` isn't set on a
+   * specific span.
+   */
+  getMastraEnvironment?(): string | undefined;
+
+  /**
+   * Internal hook used by the parent `Observability` entrypoint to push the
+   * resolved Mastra-level environment into this instance during
+   * `setMastraContext`. Implementations should store the value for later reads
+   * via `getMastraEnvironment()`.
+   */
+  __setMastraEnvironment?(environment: string | undefined): void;
 }
 
 // ============================================================================
@@ -262,14 +325,34 @@ export interface ObservabilityEntrypoint {
   /**
    * Add a score to a persisted trace or span without hydrating a RecordedTrace.
    * Useful for durable executions that persist only identifiers across serialization boundaries.
+   *
+   * `traceId` anchors the scored target when available.
+   * Include `spanId` when the score is about a specific span.
+   * Include `correlationContext` to emit immediately from live span/trace state
+   * without rehydrating the target from storage first.
    */
-  addScore?(args: { traceId: string; spanId?: string; score: ScoreInput }): Promise<void>;
+  addScore?(args: {
+    traceId?: string;
+    spanId?: string;
+    correlationContext?: CorrelationContext;
+    score: ScoreInput;
+  }): Promise<void>;
 
   /**
    * Add feedback to a persisted trace or span without hydrating a RecordedTrace.
    * Useful for durable executions that persist only identifiers across serialization boundaries.
+   *
+   * `traceId` anchors the feedback target when available.
+   * Include `spanId` when the feedback is about a specific span.
+   * Include `correlationContext` to emit immediately from live span/trace state
+   * without rehydrating the target from storage first.
    */
-  addFeedback?(args: { traceId: string; spanId?: string; feedback: FeedbackInput }): Promise<void>;
+  addFeedback?(args: {
+    traceId?: string;
+    spanId?: string;
+    correlationContext?: CorrelationContext;
+    feedback: FeedbackInput;
+  }): Promise<void>;
 
   // Registry management methods
   registerInstance(name: string, instance: ObservabilityInstance, isDefault?: boolean): void;
@@ -367,6 +450,36 @@ export interface ObservabilityInstanceConfig {
   /** Set to `true` if you want to see spans internal to the operation of mastra */
   includeInternalSpans?: boolean;
   /**
+   * Span types to exclude from export. Spans of these types are silently dropped
+   * before reaching exporters. This is useful for reducing noise and costs in
+   * observability platforms that charge per-span (e.g., Langfuse).
+   *
+   * @example
+   * ```typescript
+   * excludeSpanTypes: [SpanType.MODEL_CHUNK, SpanType.MODEL_STEP]
+   * ```
+   */
+  excludeSpanTypes?: SpanType[];
+  /**
+   * Filter function to control which spans are exported. Return `true` to keep
+   * the span, `false` to drop it. This runs after `excludeSpanTypes` and
+   * `spanOutputProcessors`, giving you access to the final exported span data
+   * for fine-grained filtering by type, attributes, entity, metadata, or any
+   * combination.
+   *
+   * @example
+   * ```typescript
+   * spanFilter: (span) => {
+   *   // Drop all model chunks
+   *   if (span.type === SpanType.MODEL_CHUNK) return false;
+   *   // Only keep tool calls that failed
+   *   if (span.type === SpanType.TOOL_CALL && span.attributes?.success) return false;
+   *   return true;
+   * }
+   * ```
+   */
+  spanFilter?: (span: AnyExportedSpan) => boolean;
+  /**
    * RequestContext keys to automatically extract as metadata for all spans
    * created with this observability configuration.
    * Supports dot notation for nested values.
@@ -421,6 +534,7 @@ export type ConfigSelector = (
 export interface InitExporterOptions {
   mastra?: Mastra;
   config?: ObservabilityInstanceConfig;
+  emitDropEvent?: (event: ObservabilityDropEvent) => void;
 }
 
 export interface InitBridgeOptions {
@@ -446,6 +560,9 @@ export interface ObservabilityEvents {
 
   /** Handle feedback events */
   onFeedbackEvent?(event: FeedbackEvent): void | Promise<void>;
+
+  /** Handle exporter pipeline droppedEvent */
+  onDroppedEvent?(event: ObservabilityDropEvent): void | Promise<void>;
 
   /** Export tracing events */
   exportTracingEvent(event: TracingEvent): Promise<void>;

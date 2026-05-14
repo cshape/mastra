@@ -71,6 +71,7 @@ export function createPrepareMemoryStep<OUTPUT = undefined>({
         resourceId,
         generateMessageId: capabilities.generateMessageId,
         logger: capabilities.logger,
+        filterIncompleteToolCalls: memoryConfig?.filterIncompleteToolCalls,
         // @ts-expect-error Flag for agent network messages
         _agentNetworkAppend: capabilities._agentNetworkAppend,
       });
@@ -107,7 +108,7 @@ export function createPrepareMemoryStep<OUTPUT = undefined>({
 
         return {
           threadExists: false,
-          thread: undefined,
+          thread: thread as StorageThreadType | undefined,
           messageList,
           processorStates,
           tripwire,

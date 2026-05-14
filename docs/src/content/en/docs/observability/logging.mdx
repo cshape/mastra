@@ -10,7 +10,7 @@ packages:
 
 Mastra's logging system captures function execution, input data, and output responses in a structured format.
 
-When deploying to Mastra Cloud, logs are shown on the [Logs](/docs/mastra-cloud/observability) page. In self-hosted or custom environments, logs can be directed to files or external services depending on the configured transports.
+When deploying to the Mastra platform, logs are shown in the dashboard. In self-hosted or custom environments, logs can be directed to files or external services depending on the configured transports.
 
 ## Configuring logs with `PinoLogger`
 
@@ -44,10 +44,10 @@ No code changes are required. Mastra wraps the configured logger so that it writ
 
 You can control which log levels reach observability storage independently from your console logger. Add a `logging` option to your observability instance configuration:
 
-```typescript {13-16} title="src/mastra/index.ts"
+```typescript {12-15} title="src/mastra/index.ts"
 import { Mastra } from '@mastra/core/mastra'
 import { PinoLogger } from '@mastra/loggers'
-import { Observability, DefaultExporter } from '@mastra/observability'
+import { Observability, MastraStorageExporter } from '@mastra/observability'
 
 export const mastra = new Mastra({
   logger: new PinoLogger({ name: 'Mastra', level: 'debug' }),
@@ -55,7 +55,7 @@ export const mastra = new Mastra({
     configs: {
       default: {
         serviceName: 'my-app',
-        exporters: [new DefaultExporter()],
+        exporters: [new MastraStorageExporter()],
         logging: {
           enabled: true, // set to false to disable log forwarding
           level: 'info', // minimum level: 'debug' | 'info' | 'warn' | 'error' | 'fatal'

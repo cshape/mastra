@@ -101,6 +101,14 @@ const sidebars = {
         },
         {
           type: 'doc',
+          id: 'agents/background-tasks',
+          label: 'Background Tasks',
+          customProps: {
+            tags: ['new'],
+          },
+        },
+        {
+          type: 'doc',
           id: 'agents/processors',
           label: 'Processors',
         },
@@ -111,6 +119,11 @@ const sidebars = {
         },
         {
           type: 'doc',
+          id: 'agents/response-caching',
+          label: 'Response caching',
+        },
+        {
+          type: 'doc',
           id: 'agents/agent-approval',
           label: 'Agent Approval',
         },
@@ -118,6 +131,22 @@ const sidebars = {
           type: 'doc',
           id: 'agents/adding-voice',
           label: 'Voice',
+        },
+        {
+          type: 'doc',
+          id: 'agents/channels',
+          label: 'Channels',
+          customProps: {
+            tags: ['new'],
+          },
+        },
+        {
+          type: 'doc',
+          id: 'agents/signals',
+          label: 'Signals',
+          customProps: {
+            tags: ['experimental'],
+          },
         },
         {
           type: 'doc',
@@ -223,6 +252,35 @@ const sidebars = {
           id: 'workflows/error-handling',
           label: 'Error Handling',
         },
+        {
+          type: 'doc',
+          id: 'workflows/scheduled-workflows',
+          label: 'Scheduled Workflows',
+        },
+      ],
+    },
+    {
+      type: 'category',
+      label: 'Editor',
+      customProps: {
+        tags: ['new'],
+      },
+      items: [
+        {
+          type: 'doc',
+          id: 'editor/overview',
+          label: 'Overview',
+        },
+        {
+          type: 'doc',
+          id: 'editor/tools',
+          label: 'Tools',
+        },
+        {
+          type: 'doc',
+          id: 'editor/prompts',
+          label: 'Prompts',
+        },
       ],
     },
     {
@@ -249,6 +307,14 @@ const sidebars = {
           id: 'streaming/workflow-streaming',
           label: 'Workflow Streaming',
         },
+        {
+          type: 'doc',
+          id: 'streaming/background-task-streaming',
+          label: 'Background Task Streaming',
+          customProps: {
+            tags: ['new'],
+          },
+        },
       ],
     },
     {
@@ -263,17 +329,14 @@ const sidebars = {
         },
         {
           type: 'doc',
-          id: 'mcp/publishing-mcp-server',
-          label: 'Publishing an MCP Server',
+          id: 'mcp/mcp-apps',
+          label: 'MCP Apps',
         },
       ],
     },
     {
       type: 'category',
       label: 'Workspaces',
-      customProps: {
-        tags: ['new'],
-      },
       items: [
         {
           type: 'doc',
@@ -304,6 +367,35 @@ const sidebars = {
           type: 'doc',
           id: 'workspace/search',
           label: 'Search and Indexing',
+        },
+      ],
+    },
+    {
+      type: 'category',
+      label: 'Browser',
+      customProps: {
+        tags: ['new'],
+      },
+      items: [
+        {
+          type: 'doc',
+          id: 'browser/overview',
+          label: 'Overview',
+        },
+        {
+          type: 'doc',
+          id: 'browser/agent-browser',
+          label: 'AgentBrowser',
+        },
+        {
+          type: 'doc',
+          id: 'browser/stagehand',
+          label: 'Stagehand',
+        },
+        {
+          type: 'doc',
+          id: 'browser/browser-viewer',
+          label: 'BrowserViewer',
         },
       ],
     },
@@ -384,6 +476,11 @@ const sidebars = {
               type: 'doc',
               id: 'server/auth/firebase',
               label: 'Firebase',
+            },
+            {
+              type: 'doc',
+              id: 'server/auth/fga',
+              label: 'Fine-Grained Authorization',
             },
             {
               type: 'doc',
@@ -481,6 +578,11 @@ const sidebars = {
               items: [
                 {
                   type: 'doc',
+                  id: 'observability/tracing/bridges/datadog',
+                  label: 'Datadog',
+                },
+                {
+                  type: 'doc',
                   id: 'observability/tracing/bridges/otel',
                   label: 'OpenTelemetry',
                 },
@@ -492,18 +594,23 @@ const sidebars = {
               items: [
                 {
                   type: 'doc',
-                  id: 'observability/tracing/exporters/default',
-                  label: 'Default',
+                  id: 'observability/tracing/exporters/mastra-storage',
+                  label: 'Mastra Storage',
                 },
                 {
                   type: 'doc',
-                  id: 'observability/tracing/exporters/cloud',
-                  label: 'Cloud',
+                  id: 'observability/tracing/exporters/mastra-platform',
+                  label: 'Mastra Platform',
                 },
                 {
                   type: 'doc',
                   id: 'observability/tracing/exporters/arize',
                   label: 'Arize',
+                },
+                {
+                  type: 'doc',
+                  id: 'observability/tracing/exporters/arthur',
+                  label: 'Arthur',
                 },
                 {
                   type: 'doc',
@@ -617,30 +724,20 @@ const sidebars = {
     },
     {
       type: 'category',
-      label: 'Mastra Cloud',
+      label: 'Mastra Platform',
       customProps: {
-        tags: ['beta'],
+        tags: ['new'],
       },
       items: [
         {
           type: 'doc',
-          id: 'mastra-cloud/overview',
+          id: 'mastra-platform/overview',
           label: 'Overview',
         },
         {
           type: 'doc',
-          id: 'mastra-cloud/setup',
-          label: 'Setup',
-        },
-        {
-          type: 'doc',
-          id: 'mastra-cloud/deployment',
-          label: 'Deployment',
-        },
-        {
-          type: 'doc',
-          id: 'mastra-cloud/observability',
-          label: 'Observability',
+          id: 'mastra-platform/configuration',
+          label: 'Configuration',
         },
       ],
     },

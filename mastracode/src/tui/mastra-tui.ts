@@ -4,9 +4,8 @@
  */
 import { spawn } from 'node:child_process';
 import type { ChildProcess } from 'node:child_process';
-import { Spacer } from '@mariozechner/pi-tui';
 import type { Component } from '@mariozechner/pi-tui';
-import type { HarnessEvent } from '@mastra/core/harness';
+import type { HarnessEvent, HarnessMessage } from '@mastra/core/harness';
 import type { Workspace } from '@mastra/core/workspace';
 import { getOAuthProviders } from '../auth/storage.js';
 import {
@@ -18,28 +17,38 @@ import {
   saveSettings,
 } from '../onboarding/index.js';
 import type { OnboardingResult, ProviderAccess, ProviderAccessLevel } from '../onboarding/index.js';
-import { resolveThreadActiveModelPackId, THREAD_ACTIVE_MODEL_PACK_ID_KEY } from '../onboarding/settings.js';
+import {
+  resolveThreadActiveModelPackId,
+  THREAD_ACTIVE_MODEL_PACK_ID_KEY,
+  MEMORY_GATEWAY_PROVIDER,
+} from '../onboarding/settings.js';
 import {
   detectPackageManager,
+  fetchChangelog,
   fetchLatestVersion,
   getInstallCommand,
   isNewerVersion,
   runUpdate,
 } from '../utils/update-check.js';
 import { dispatchSlashCommand } from './command-dispatch.js';
+import { startGoalWithDefaults } from './commands/goal.js';
 
 import type { SlashCommandContext } from './commands/types.js';
-import { AskQuestionInlineComponent } from './components/ask-question-inline.js';
 import { LoginDialogComponent } from './components/login-dialog.js';
 import { ModelSelectorComponent } from './components/model-selector.js';
 import type { ModelItem } from './components/model-selector.js';
 import { showError, showInfo, showFormattedError, notify } from './display.js';
 import { dispatchEvent } from './event-dispatch.js';
+import { isGoalJudgeInputLocked, showGoalJudgeInputLockInfo } from './goal-input-lock.js';
 import type { EventHandlerContext } from './handlers/types.js';
+import { askModalQuestion } from './modal-question.js';
+import { showModalOverlay } from './overlay.js';
 import { promptForApiKeyIfNeeded } from './prompt-api-key.js';
 
 import {
+  addPendingUserMessage,
   addUserMessage,
+  removePendingUserMessage,
   renderCompletedTasksInline,
   renderClearedTasksInline,
   renderExistingMessages,
@@ -75,6 +84,18 @@ const UPDATE_RECHECK_INTERVAL_MS = 45 * 60 * 1_000; // 45 minutes
 const IMAGE_PLACEHOLDER_PATTERN = /\[image\]\s*/g;
 const CAFFEINATE_ARGS = ['-i', '-m'];
 
+export async function syncInitialThreadState(state: TUIState): Promise<void> {
+  const initThreadId = state.harness.getCurrentThreadId();
+  if (!initThreadId) return;
+
+  const initThreads = await state.harness.listThreads();
+  const initThread = initThreads.find(t => t.id === initThreadId);
+  if (initThread?.title) {
+    state.currentThreadTitle = initThread.title;
+  }
+  state.goalManager.loadFromThreadMetadata(initThread?.metadata as Record<string, unknown> | undefined);
+}
+
 function shouldUseCaffeinate(): boolean {
   return process.platform === 'darwin' && process.env.MASTRACODE_DISABLE_CAFFEINATE !== '1';
 }
@@ -97,6 +118,7 @@ export class MastraTUI {
   private updateCheckTimer: ReturnType<typeof setInterval> | null = null;
   private hasShownUpdateBanner = false;
   private caffeinateProcess: ChildProcess | null = null;
+  private lastStreamError: string | null = null;
 
   private static readonly DOUBLE_CTRL_C_MS = 500;
 
@@ -167,16 +189,52 @@ export class MastraTUI {
       hookMgr.runSessionStart().catch(() => {});
     }
 
-    // Process initial message if provided
+    // Process initial message if provided (e.g. piped stdin content).
+    // Runs the same validation as interactive input: model check, prompt hooks.
     if (this.state.options.initialMessage) {
-      this.fireMessage(this.state.options.initialMessage);
+      const msg = this.state.options.initialMessage;
+
+      if (!this.state.harness.hasModelSelected()) {
+        showInfo(this.state, 'No model selected. Use /models to select a model, or /login to authenticate.');
+      } else {
+        const messageId = `user-${Date.now()}`;
+        addUserMessage(this.state, {
+          id: messageId,
+          role: 'user',
+          content: [{ type: 'text', text: msg }],
+          createdAt: new Date(),
+        });
+        this.state.ui.requestRender();
+
+        const allowed = await this.runUserPromptHook(msg);
+        if (!allowed) {
+          const comp = this.state.messageComponentsById.get(messageId);
+          if (comp) {
+            this.state.chatContainer.removeChild(comp as never);
+            this.state.messageComponentsById.delete(messageId);
+            this.state.ui.requestRender();
+          }
+        } else {
+          try {
+            if (this.state.pendingNewThread) {
+              await this.state.harness.createThread();
+              this.state.pendingNewThread = false;
+            }
+            this.fireMessage(msg);
+          } catch (error) {
+            this.state.pendingNewThread = false;
+            showError(this.state, error instanceof Error ? error.message : 'Failed to start thread');
+          }
+        }
+      }
     }
 
     // Main interactive loop — never blocks on streaming,
     // so the editor stays responsive for queued follow-ups.
     while (true) {
       const userInput = await this.getUserInput();
-      if (!userInput.trim()) continue;
+      // allow space as transparent continue (for recovering from api errors manually)
+      if (!userInput.trim() && userInput !== ' ') continue;
 
       try {
         // Handle slash commands
@@ -191,44 +249,23 @@ export class MastraTUI {
           continue;
         }
 
-        // Create thread lazily on first message (may load last-used model)
-        if (this.state.pendingNewThread) {
-          await this.state.harness.createThread();
-          this.state.pendingNewThread = false;
-        }
-
-        // Check if a model is selected
+        // Check if a model is selected (sync — fast, no reason to defer)
         if (!this.state.harness.hasModelSelected()) {
           showInfo(this.state, 'No model selected. Use /models to select a model, or /login to authenticate.');
-          continue;
-        }
-
-        const allowed = await this.runUserPromptHook(userInput);
-        if (!allowed) {
           continue;
         }
 
         const { content, images } = consumePendingImages(userInput, this.state.pendingImages);
         this.state.pendingImages = [];
 
-        // Add user message to chat immediately
-        addUserMessage(this.state, {
-          id: `user-${Date.now()}`,
-          role: 'user',
-          content: [
-            { type: 'text', text: content },
-            ...(images?.map(img => ({
-              type: 'image' as const,
-              data: img.data,
-              mimeType: img.mimeType,
-            })) ?? []),
-          ],
-          createdAt: new Date(),
-        });
-        this.state.ui.requestRender();
+        const optimisticMessageId = this.renderOptimisticUserMessage(content, images);
+        const allowed = await this.runUserPromptHook(userInput);
+        if (!allowed) {
+          this.removeOptimisticUserMessage(optimisticMessageId);
+          continue;
+        }
 
-        // Normal send — fire and forget; events handle the rest
-        this.fireMessage(content, images);
+        this.sendOptimisticSignal(content, images, optimisticMessageId);
       } catch (error) {
         showError(this.state, error instanceof Error ? error.message : 'Unknown error');
       }
@@ -242,6 +279,122 @@ export class MastraTUI {
   private fireMessage(content: string, images?: Array<{ data: string; mimeType: string }>): void {
     const files = images?.map(img => ({ data: img.data, mediaType: img.mimeType }));
     this.state.harness.sendMessage({ content, files }).catch(error => {
+      showError(this.state, error instanceof Error ? error.message : 'Unknown error');
+    });
+  }
+
+  private createUserSignalMessage(
+    content: string,
+    images?: Array<{ data: string; mimeType: string }>,
+    id = '',
+  ): HarnessMessage {
+    return {
+      id,
+      role: 'user',
+      content: [
+        { type: 'text', text: content },
+        ...(images?.map(img => ({ type: 'image' as const, data: img.data, mimeType: img.mimeType })) ?? []),
+      ],
+      createdAt: new Date(),
+    };
+  }
+
+  private createUserSignalContent(content: string, images?: Array<{ data: string; mimeType: string }>) {
+    return images?.length
+      ? {
+          role: 'user' as const,
+          content: [
+            { type: 'text' as const, text: content },
+            ...images.map(img => ({ type: 'file' as const, data: img.data, mediaType: img.mimeType })),
+          ],
+        }
+      : content;
+  }
+
+  private renderOptimisticUserMessage(content: string, images?: Array<{ data: string; mimeType: string }>): string {
+    const messageId = `user-${Date.now()}`;
+    addUserMessage(this.state, this.createUserSignalMessage(content, images, messageId));
+    this.state.ui.requestRender();
+    return messageId;
+  }
+
+  private removeOptimisticUserMessage(messageId: string): void {
+    const component = this.state.messageComponentsById.get(messageId);
+    if (!component) return;
+    this.state.chatContainer.removeChild(component as never);
+    this.state.messageComponentsById.delete(messageId);
+    this.state.ui.requestRender();
+  }
+
+  private remapOptimisticUserMessage(optimisticMessageId: string, signalId: string): void {
+    if (optimisticMessageId === signalId) return;
+    const component = this.state.messageComponentsById.get(optimisticMessageId);
+    if (!component) return;
+    this.state.messageComponentsById.delete(optimisticMessageId);
+    this.state.messageComponentsById.set(signalId, component);
+  }
+
+  private createPendingNewThread(): Promise<void> | undefined {
+    if (!this.state.pendingNewThread) return undefined;
+    this.state.pendingNewThread = false;
+    return this.state.harness.createThread().then(() => undefined);
+  }
+
+  private sendOptimisticSignal(
+    content: string,
+    images: Array<{ data: string; mimeType: string }> | undefined,
+    optimisticMessageId: string,
+  ): void {
+    const send = () => {
+      const signal = this.state.harness.sendSignal({ content: this.createUserSignalContent(content, images) });
+      this.remapOptimisticUserMessage(optimisticMessageId, signal.id);
+      signal.accepted.catch((error: unknown) => {
+        this.removeOptimisticUserMessage(signal.id);
+        showError(this.state, error instanceof Error ? error.message : 'Unknown error');
+      });
+    };
+
+    const pendingThread = this.createPendingNewThread();
+    if (!pendingThread) {
+      send();
+      return;
+    }
+
+    pendingThread.then(send).catch((error: unknown) => {
+      this.removeOptimisticUserMessage(optimisticMessageId);
+      showError(this.state, error instanceof Error ? error.message : 'Unknown error');
+    });
+  }
+
+  private signalMessage(content: string, images?: Array<{ data: string; mimeType: string }>): void {
+    const hasActiveRun = this.state.harness.isCurrentThreadStreamActive();
+
+    const send = () => {
+      const signal = this.state.harness.sendSignal({ content: this.createUserSignalContent(content, images) });
+
+      if (hasActiveRun) {
+        addPendingUserMessage(this.state, signal.id, content, images);
+      } else {
+        addUserMessage(this.state, this.createUserSignalMessage(content, images, signal.id));
+      }
+
+      signal.accepted.catch((error: unknown) => {
+        if (hasActiveRun) {
+          removePendingUserMessage(this.state, signal.id);
+        } else {
+          this.removeOptimisticUserMessage(signal.id);
+        }
+        showError(this.state, error instanceof Error ? error.message : 'Unknown error');
+      });
+    };
+
+    const pendingThread = this.createPendingNewThread();
+    if (!pendingThread) {
+      send();
+      return;
+    }
+
+    pendingThread.then(send).catch((error: unknown) => {
       showError(this.state, error instanceof Error ? error.message : 'Unknown error');
     });
   }
@@ -328,16 +481,9 @@ export class MastraTUI {
     // This emits om_status → display_state_changed → updateStatusLine.
     await this.state.harness.loadOMProgress();
 
-    // Sync current thread title — the thread_changed event from
+    // Sync current thread metadata — the thread_changed event from
     // promptForThreadSelection fired before we subscribed above.
-    const initThreadId = this.state.harness.getCurrentThreadId();
-    if (initThreadId) {
-      const initThreads = await this.state.harness.listThreads();
-      const initThread = initThreads.find(t => t.id === initThreadId);
-      if (initThread?.title) {
-        this.state.currentThreadTitle = initThread.title;
-      }
-    }
+    await syncInitialThreadState(this.state);
 
     // Start the UI
     this.state.ui.start();
@@ -408,6 +554,16 @@ export class MastraTUI {
   private async handleEvent(event: HarnessEvent): Promise<void> {
     if (event.type === 'agent_start') {
       this.startCaffeinate();
+      this.lastStreamError = null;
+    }
+
+    if (event.type === 'error' && 'error' in event && !event.retryable) {
+      // Only capture errors that look like stream/agent failures, not OM or tool errors
+      const msg = event.error?.message || String(event.error);
+      const isOmError = /observational memory/i.test(msg);
+      if (!isOmError) {
+        this.lastStreamError = msg;
+      }
     }
 
     try {
@@ -422,12 +578,53 @@ export class MastraTUI {
       if (event.type === 'agent_end') {
         const stopReason = event.reason === 'aborted' ? 'aborted' : event.reason === 'error' ? 'error' : 'complete';
         await this.runStopHook(stopReason);
+
+        if (event.reason === 'error' && this.lastStreamError) {
+          this.emitErrorFeedback(this.lastStreamError);
+          this.lastStreamError = null;
+        }
       }
     } finally {
       if (event.type === 'agent_end') {
         this.stopCaffeinate();
       }
     }
+  }
+
+  private emitErrorFeedback(errorMessage: string): void {
+    const harness = this.state.harness;
+    const traceId = harness.getCurrentTraceId() ?? undefined;
+    const runId = harness.getCurrentRunId() ?? undefined;
+    const threadId = harness.getCurrentThreadId() ?? undefined;
+
+    if (!traceId && !runId && !threadId) return;
+
+    const mastra = harness.getMastra();
+    const observability = mastra?.observability;
+    if (!observability?.addFeedback) return;
+
+    const comment = errorMessage.length > 500 ? errorMessage.slice(0, 500) + '…' : errorMessage;
+
+    observability
+      .addFeedback({
+        traceId,
+        correlationContext: { traceId, runId },
+        feedback: {
+          feedbackType: 'thumbs',
+          feedbackSource: 'mastracode',
+          feedbackUserId: 'system',
+          value: 0,
+          comment: `Stream error: ${comment}`,
+          metadata: {
+            ...(threadId ? { threadId } : {}),
+            ...(runId ? { runId } : {}),
+            autoGenerated: true,
+          },
+        },
+      })
+      .catch(() => {
+        // Fire-and-forget — don't let feedback failures affect the TUI
+      });
   }
 
   private startCaffeinate(): void {
@@ -483,7 +680,15 @@ export class MastraTUI {
       cerebras: hasEnv('cerebras') ? ('apikey' as const) : false,
       google: hasEnv('google') ? ('apikey' as const) : false,
       deepseek: hasEnv('deepseek') ? ('apikey' as const) : false,
+      'github-copilot': accessLevel('github-copilot'),
     };
+    // Gateway covers all providers
+    const mgKey =
+      this.state.authStorage?.getStoredApiKey(MEMORY_GATEWAY_PROVIDER) ?? process.env['MASTRA_GATEWAY_API_KEY'];
+    if (mgKey) {
+      if (!access.anthropic) access.anthropic = 'apikey';
+      if (!access.openai) access.openai = 'apikey';
+    }
     // Include all other providers that have API keys configured
     const seen = new Set(Object.keys(access));
     for (const m of models) {
@@ -572,9 +777,16 @@ export class MastraTUI {
    * If no follow-ups are pending, appends to end.
    */
   private addChildBeforeFollowUps(child: Component): void {
-    if (this.state.followUpComponents.length > 0) {
-      const firstFollowUp = this.state.followUpComponents[0];
-      const idx = this.state.chatContainer.children.indexOf(firstFollowUp as any);
+    const firstPinned = [
+      ...this.state.followUpComponents,
+      ...this.state.pendingSignalMessageComponentsById.values(),
+    ].find(pinned =>
+      this.state.chatContainer.children.includes(('component' in pinned ? pinned.component : pinned) as any),
+    );
+
+    if (firstPinned) {
+      const component = 'component' in firstPinned ? firstPinned.component : firstPinned;
+      const idx = this.state.chatContainer.children.indexOf(component as any);
       if (idx >= 0) {
         (this.state.chatContainer.children as unknown[]).splice(idx, 0, child);
         this.state.chatContainer.invalidate();
@@ -591,6 +803,13 @@ export class MastraTUI {
   private getUserInput(): Promise<string> {
     return new Promise(resolve => {
       this.state.editor.onSubmit = (text: string) => {
+        if (isGoalJudgeInputLocked(this.state)) {
+          this.state.editor.setText(text);
+          showGoalJudgeInputLockInfo(this.state);
+          this.state.ui.requestRender();
+          return;
+        }
+
         // Add to history for arrow up/down navigation (skip empty)
         if (text.trim()) {
           this.state.editor.addToHistory(text);
@@ -598,7 +817,20 @@ export class MastraTUI {
         this.state.editor.setText('');
 
         if (this.state.harness.isRunning()) {
-          this.queueFollowUpMessage(text);
+          if (text.startsWith('/')) {
+            this.queueFollowUpMessage(text);
+            return;
+          }
+
+          const { content, images } = consumePendingImages(text, this.state.pendingImages);
+          this.state.pendingImages = [];
+          if (images?.length) {
+            this.state.pendingImages = images;
+            this.queueFollowUpMessage(text);
+            return;
+          }
+
+          this.signalMessage(content);
           return;
         }
 
@@ -657,6 +889,8 @@ export class MastraTUI {
       addUserMessage: msg => addUserMessage(this.state, msg),
       addChildBeforeFollowUps: child => this.addChildBeforeFollowUps(child),
       fireMessage: (content, images) => this.fireMessage(content, images),
+      startGoal: (objective, cancelMessage, options) =>
+        startGoalWithDefaults(this.buildCommandContext(), objective, cancelMessage, options),
       queueFollowUpMessage: content => this.queueFollowUpMessage(content),
       renderExistingMessages: () => renderExistingMessages(this.state),
       renderCompletedTasksInline: (tasks, insertIndex, collapsed) =>
@@ -695,11 +929,7 @@ export class MastraTUI {
         resolve();
       });
 
-      this.state.ui.showOverlay(dialog, {
-        width: '80%',
-        maxHeight: '60%',
-        anchor: 'center',
-      });
+      showModalOverlay(this.state.ui, dialog, { widthPercent: 0.8, maxHeight: '60%' });
       dialog.focused = true;
 
       this.state
@@ -780,11 +1010,13 @@ export class MastraTUI {
         previous,
         onComplete: async (result: OnboardingResult) => {
           this.state.activeOnboarding = undefined;
+          this.state.ui.hideOverlay();
           await this.applyOnboardingResult(result);
           resolve();
         },
         onCancel: () => {
           this.state.activeOnboarding = undefined;
+          this.state.ui.hideOverlay();
           const settings = loadSettings();
           if (!settings.onboarding.completedAt) {
             settings.onboarding.skippedAt = new Date().toISOString();
@@ -830,22 +1062,15 @@ export class MastraTUI {
               },
             });
 
-            this.state.ui.showOverlay(selector, {
-              width: '80%',
-              maxHeight: '60%',
-              anchor: 'center',
-            });
+            showModalOverlay(this.state.ui, selector, { maxHeight: '75%' });
             selector.focused = true;
           });
         },
       });
 
       this.state.activeOnboarding = component;
-      this.state.chatContainer.addChild(new Spacer(1));
-      this.state.chatContainer.addChild(component);
-      this.state.chatContainer.addChild(new Spacer(1));
-      this.state.ui.requestRender();
-      this.state.chatContainer.invalidate();
+      showModalOverlay(this.state.ui, component, { maxHeight: '80%' });
+      component.focused = true;
     });
   }
 
@@ -920,6 +1145,10 @@ export class MastraTUI {
 
     settings.models.activeOmPackId = omPack.id;
     settings.models.omModelOverride = omPack.id === 'custom' ? omPack.modelId : null;
+    // Clear any per-role overrides from prior /om use so the newly-selected
+    // pack (or custom modelId above) applies to both observer and reflector.
+    settings.models.observerModelOverride = null;
+    settings.models.reflectorModelOverride = null;
     settings.preferences.yolo = result.yolo;
 
     // Clear any manual subagent overrides so they derive from the active pack
@@ -983,69 +1212,55 @@ export class MastraTUI {
       return;
     }
 
-    const pm = await detectPackageManager();
+    const [pm, changelog] = await Promise.all([detectPackageManager(), fetchChangelog(latestVersion)]);
 
     // Prompt the user (and mark banner as shown so periodic checks don't repeat it)
     this.hasShownUpdateBanner = true;
-    await this.showUpdatePrompt(currentVersion, latestVersion, pm);
+    await this.showUpdatePrompt(currentVersion, latestVersion, pm, changelog);
   }
 
   /**
-   * Show an inline Y/N prompt offering to auto-update.
+   * Show a Y/N prompt offering to auto-update.
    */
-  private showUpdatePrompt(
+  private async showUpdatePrompt(
     currentVersion: string,
     latestVersion: string,
     pm: Awaited<ReturnType<typeof detectPackageManager>>,
+    changelog: string | null,
   ): Promise<void> {
-    return new Promise<void>(resolve => {
-      const questionComponent = new AskQuestionInlineComponent(
-        {
-          question: `A new version of Mastra Code is available: v${latestVersion} (current: v${currentVersion}). Would you like to update now?`,
-          options: [
-            { label: 'Yes', description: 'Update and restart' },
-            { label: 'No', description: 'Skip this version' },
-          ],
-          formatResult: answer => (answer === 'Yes' ? 'Updating…' : 'Update skipped.'),
-          onSubmit: async answer => {
-            this.state.activeInlineQuestion = undefined;
-            if (answer === 'Yes') {
-              showInfo(this.state, `Updating to v${latestVersion}…`);
-              const ok = await runUpdate(pm, latestVersion);
-              if (ok) {
-                showInfo(this.state, `Updated to v${latestVersion}. Please restart Mastra Code.`);
-                this.stop();
-                process.exit(0);
-              } else {
-                const cmd = getInstallCommand(pm, latestVersion);
-                showError(this.state, `Auto-update failed. Run \`${cmd}\` manually.`);
-              }
-            } else {
-              // User declined — save the dismissed version
-              const settings = loadSettings();
-              settings.updateDismissedVersion = latestVersion;
-              saveSettings(settings);
-              showInfo(this.state, `Update skipped. Run /update to update later.`);
-            }
-            resolve();
-          },
-          onCancel: () => {
-            this.state.activeInlineQuestion = undefined;
-            // Treat cancel (Esc / Ctrl+C) the same as "No"
-            const settings = loadSettings();
-            settings.updateDismissedVersion = latestVersion;
-            saveSettings(settings);
-            resolve();
-          },
-        },
-        this.state.ui,
-      );
+    let question = `A new version of Mastra Code is available: v${latestVersion} (current: v${currentVersion}).`;
+    if (changelog) {
+      question += `\n\nWhat's new:\n${changelog}`;
+    }
+    question += `\n\nWould you like to update now?`;
 
-      this.state.activeInlineQuestion = questionComponent;
-      this.state.chatContainer.addChild(questionComponent);
-      this.state.chatContainer.addChild(new Spacer(1));
-      this.state.ui.requestRender();
-      this.state.chatContainer.invalidate();
+    const answer = await askModalQuestion(this.state.ui, {
+      question,
+      options: [
+        { label: 'Yes', description: 'Update and restart' },
+        { label: 'No', description: 'Skip this version' },
+      ],
     });
+
+    if (answer === 'Yes') {
+      showInfo(this.state, `Updating to v${latestVersion}…`);
+      const ok = await runUpdate(pm, latestVersion);
+      if (ok) {
+        showInfo(this.state, `Updated to v${latestVersion}. Please restart Mastra Code.`);
+        this.stop();
+        process.exit(0);
+      } else {
+        const cmd = getInstallCommand(pm, latestVersion);
+        showError(this.state, `Auto-update failed. Run \`${cmd}\` manually.`);
+      }
+    } else {
+      // User declined — save the dismissed version
+      const settings = loadSettings();
+      settings.updateDismissedVersion = latestVersion;
+      saveSettings(settings);
+      if (answer === 'No') {
+        showInfo(this.state, `Update skipped. Run /update to update later.`);
+      }
+    }
   }
 }

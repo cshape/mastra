@@ -2,6 +2,7 @@ import { jsonLanguage } from '@codemirror/lang-json';
 import { markdown, markdownLanguage } from '@codemirror/lang-markdown';
 import { HighlightStyle, syntaxHighlighting } from '@codemirror/language';
 import { languages } from '@codemirror/language-data';
+import { EditorState } from '@codemirror/state';
 import type { Extension } from '@codemirror/state';
 import { EditorView } from '@codemirror/view';
 import { tags as t } from '@lezer/highlight';
@@ -13,9 +14,9 @@ import type { HTMLAttributes } from 'react';
 import { createVariableAutocomplete } from './variable-autocomplete-extension';
 import { variableHighlight } from './variable-highlight-extension';
 import { CopyButton } from '@/ds/components/CopyButton';
+import { useTheme } from '@/ds/components/ThemeProvider';
 import type { JsonSchema } from '@/lib/json-schema';
 import { cn } from '@/lib/utils';
-import { useIsDarkMode } from '@/store/playground-store';
 
 export type CodeEditorLanguage = 'json' | 'markdown';
 
@@ -216,7 +217,7 @@ function buildLightTheme(): Extension {
 }
 
 export const useCodemirrorTheme = (): Extension => {
-  const isDark = useIsDarkMode();
+  const isDark = useTheme().resolvedTheme === 'dark';
   return useMemo(() => (isDark ? buildDarkTheme() : buildLightTheme()), [isDark]);
 };
 
@@ -234,6 +235,8 @@ export type CodeEditorProps = {
   autoFocus?: boolean;
   /** Show line numbers in the gutter (default: true) */
   lineNumbers?: boolean;
+  /** When false, makes the editor read-only */
+  editable?: boolean;
 } & Omit<HTMLAttributes<HTMLDivElement>, 'onChange'>;
 
 export const CodeEditor = forwardRef<ReactCodeMirrorRef, CodeEditorProps>(
@@ -250,6 +253,7 @@ export const CodeEditor = forwardRef<ReactCodeMirrorRef, CodeEditorProps>(
       schema,
       autoFocus,
       lineNumbers = true,
+      editable,
       ...props
     },
     ref,
@@ -275,8 +279,12 @@ export const CodeEditor = forwardRef<ReactCodeMirrorRef, CodeEditorProps>(
         exts.push(createVariableAutocomplete(schema));
       }
 
+      if (editable === false) {
+        exts.push(EditorState.readOnly.of(true));
+      }
+
       return exts;
-    }, [language, highlightVariables, schema]);
+    }, [language, highlightVariables, schema, editable]);
 
     return (
       <div
@@ -290,6 +298,7 @@ export const CodeEditor = forwardRef<ReactCodeMirrorRef, CodeEditorProps>(
           theme={theme}
           extensions={extensions}
           onChange={onChange}
+          editable={editable}
           aria-label="Code editor"
           placeholder={placeholder}
           height="100%"

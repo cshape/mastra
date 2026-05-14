@@ -11,6 +11,7 @@ describe('buildHelpText', () => {
     expect(text).toContain('/settings');
     expect(text).toContain('/models');
     expect(text).not.toContain('/models:pack');
+    expect(text).not.toContain('/memory-gateway');
     expect(text).toContain('/help');
   });
 
@@ -25,8 +26,9 @@ describe('buildHelpText', () => {
     expect(text).toContain('Ctrl+C');
     expect(text).toContain('Ctrl+D');
     expect(text).toContain('Enter');
-    expect(text).toContain('Send message / queue follow-up');
-    expect(text).not.toContain('Ctrl+F');
+    expect(text).toContain('Send message');
+    expect(text).toContain('Ctrl+F');
+    expect(text).toContain('Queue follow-up');
     expect(text).toContain('Ctrl+T');
     expect(text).toContain('Ctrl+E');
     expect(text).toContain('Ctrl+Y');
